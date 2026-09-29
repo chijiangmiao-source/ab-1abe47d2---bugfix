@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>飞行数据链路规则隔离审计</title>
+<style>
+:root{
+  --bg:#0f1720; --panel:#18222e; --line:#2a3a4d; --text:#e6edf3;
+  --muted:#8da2b5; --accent:#3fa9f5; --hit:#4ac26b; --shadow:#f08080;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:"Segoe UI",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text)}
+header{padding:20px 28px;border-bottom:1px solid var(--line);background:var(--panel)}
+h1{font-size:20px;margin:0 0 6px}
+header p{margin:0;color:var(--muted);font-size:13px;line-height:1.6;max-width:1080px}
+main{padding:20px 28px;max-width:1320px;margin:0 auto}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:18px}
+h2{font-size:15px;margin:0 0 12px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:middle}
+th{background:#101a25;color:var(--muted);font-weight:600;white-space:nowrap}
+input,select{background:#0d141d;border:1px solid var(--line);color:var(--text);border-radius:6px;padding:6px 8px;font-size:13px;width:100%}
+input:focus,select:focus{outline:1px solid var(--accent)}
+button{background:var(--accent);border:none;color:#04121f;font-weight:600;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer}
+button.ghost{background:transparent;border:1px solid var(--line);color:var(--text)}
+button.del{background:transparent;color:var(--shadow);border:1px solid var(--line);padding:4px 9px}
+button:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px}
+.field{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+.field input{width:280px}
+.tag{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
+.tag.hit{background:rgba(46,160,67,.15);color:var(--hit);border:1px solid rgba(46,160,67,.45)}
+.tag.shadowed{background:rgba(214,69,69,.15);color:var(--shadow);border:1px solid rgba(214,69,69,.45)}
+.chip{display:inline-block;background:#0d141d;border:1px solid var(--line);border-radius:6px;padding:1px 8px;margin:1px 3px 1px 0;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+.mono{font-family:ui-monospace,Consolas,monospace}
+#error{background:rgba(214,69,69,.12);border:1px solid rgba(214,69,69,.5);color:#ffb4b4;white-space:pre-wrap;font-size:13px;line-height:1.6}
+.note{color:var(--muted);font-size:12px}
+.ports{white-space:nowrap}
+.ports input{width:64px;display:inline-block}
+.toolbar{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+</style>
+</head>
+<body>
+<header>
+  <h1>飞行数据链路规则隔离审计</h1>
+  <p>上线前按优先级逐条核对报文规则：仍可命中的规则给出按「协议 → 源地址 → 目的地址 → 源端口 → 目的端口」字典序的最小报文见证；
+     被更早规则完全遮蔽的规则给出覆盖它的更早规则标识集合。判定基于协议 × 源 IPv4 × 目的 IPv4 × 源端口 × 目的端口的五维精确区域运算，
+     不抽样地址、不枚举端口。</p>
+</header>
+<main>
+  <section>
+    <h2>1. 录入审计标识与规则（至多 18 条，优先级自上而下）</h2>
+    <div class="row">
+      <label class="field">审计标识（稳定、可复查；同标识不同载荷将被拒绝）
+        <input id="auditId" class="mono" placeholder="例如 audit-2026-09-29" maxlength="64">
+      </label>
+    </div>
+    <table>
+      <thead><tr>
+        <th>#</th><th>规则标识</th><th>协议</th><th>源 CIDR</th><th>目的 CIDR</th>
+        <th>源端口（闭区间）</th><th>目的端口（闭区间）</th><th></th>
+      </tr></thead>
+      <tbody id="ruleRows"></tbody>
+    </table>
+    <div class="toolbar">
+      <button class="ghost" id="addBtn" type="button">＋ 添加规则</button>
+      <button class="ghost" id="exampleBtn" type="button">填入示例</button>
+      <button id="submitBtn" type="button">提交审计</button>
+      <span class="note" id="countNote"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>2. 按审计标识复查冻结结论</h2>
+    <div class="row">
+      <label class="field">审计标识
+        <input id="lookupId" class="mono" placeholder="提交时使用的审计标识" maxlength="64">
+      </label>
+      <button class="ghost" id="lookupBtn" type="button">查询冻结结论</button>
+    </div>
+    <div class="note">结论一经提交即冻结：同一标识再次提交不同载荷会被拒绝（HTTP 409），不会改写既有结论。</div>
+  </section>
+
+  <section id="error" hidden></section>
+
+  <section id="result" hidden>
+    <h2>逐规则结论 <span class="mono" id="resultAudit"></span></h2>
+    <div class="note" id="resultNote"></div>
+    <table style="margin-top:10px">
+      <thead><tr>
+        <th>#</th><th>规则标识</th><th>协议</th><th>源 CIDR</th><th>目的 CIDR</th>
+        <th>源端口</th><th>目的端口</th><th>裁决</th><th>最小报文见证 / 覆盖它的更早规则</th>
+      </tr></thead>
+      <tbody id="verdictRows"></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+"use strict";
+const MAX_RULES = 18;
+const rowsEl = document.getElementById('ruleRows');
+const PROTO_LABEL = {tcp: 'TCP', udp: 'UDP', both: 'TCP+UDP'};
+
+const esc = s => String(s).replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function showError(msg) {
+  const el = document.getElementById('error');
+  el.textContent = msg;
+  el.hidden = false;
+  el.scrollIntoView({behavior: 'smooth', block: 'center'});
+}
+function clearError() {
+  const el = document.getElementById('error');
+  el.hidden = true;
+  el.textContent = '';
+}
+
+function addRow(rule) {
+  if (rowsEl.children.length >= MAX_RULES) {
+    showError('至多 ' + MAX_RULES + ' 条规则。');
+    return;
+  }
+  const r = rule || {id:'', protocol:'tcp', src_cidr:'', dst_cidr:'', sp0:'', sp1:'', dp0:'', dp1:''};
+  const tr = document.createElement('tr');
+  tr.innerHTML =
+    '<td class="idx mono"></td>' +
+    '<td><input class="rid mono" maxlength="64" placeholder="r1" value="' + esc(r.id) + '"></td>' +
+    '<td><select class="proto">' +
+      '<option value="tcp">TCP</option><option value="udp">UDP</option><option value="both">TCP+UDP</option>' +
+    '</select></td>' +
+    '<td><input class="src mono" placeholder="10.0.0.0/8" value="' + esc(r.src_cidr) + '"></td>' +
+    '<td><input class="dst mono" placeholder="0.0.0.0/0" value="' + esc(r.dst_cidr) + '"></td>' +
+    '<td class="ports"><input type="number" class="sp0" min="0" max="65535" placeholder="0" value="' + esc(r.sp0) + '"> – ' +
+      '<input type="number" class="sp1" min="0" max="65535" placeholder="65535" value="' + esc(r.sp1) + '"></td>' +
+    '<td class="ports"><input type="number" class="dp0" min="0" max="65535" placeholder="0" value="' + esc(r.dp0) + '"> – ' +
+      '<input type="number" class="dp1" min="0" max="65535" placeholder="65535" value="' + esc(r.dp1) + '"></td>' +
+    '<td><button class="del" type="button" title="删除该行">✕</button></td>';
+  tr.querySelector('.proto').value = r.protocol;
+  tr.querySelector('.del').addEventListener('click', () => { tr.remove(); renumber(); });
+  rowsEl.appendChild(tr);
+  renumber();
+}
+
+function renumber() {
+  [...rowsEl.children].forEach((tr, i) => { tr.querySelector('.idx').textContent = i + 1; });
+  document.getElementById('countNote').textContent =
+    '已录入 ' + rowsEl.children.length + ' / ' + MAX_RULES + ' 条';
+}
+
+function collectRules() {
+  return [...rowsEl.children].map(tr => ({
+    id: tr.querySelector('.rid').value.trim(),
+    protocol: tr.querySelector('.proto').value,
+    src_cidr: tr.querySelector('.src').value.trim(),
+    dst_cidr: tr.querySelector('.dst').value.trim(),
+    src_port: {start: Number(tr.querySelector('.sp0').value), end: Number(tr.querySelector('.sp1').value)},
+    dst_port: {start: Number(tr.querySelector('.dp0').value), end: Number(tr.querySelector('.dp1').value)},
+  }));
+}
+
+function formatError(status, data) {
+  let msg = '请求被拒绝（HTTP ' + status + '）';
+  if (data) {
+    if (typeof data.detail === 'string') msg += '\n' + data.detail;
+    else if (data.detail && data.detail.message) msg += '\n' + data.detail.message;
+    if (Array.isArray(data.errors)) {
+      msg += '\n' + data.errors.map(e => '- ' + (e.loc || []).join('.') + ': ' + e.msg).join('\n');
+    }
+  }
+  return msg;
+}
+
+function renderResult(data, note) {
+  document.getElementById('resultAudit').textContent = '—— ' + data.audit_id;
+  document.getElementById('resultNote').textContent = (note ? note + '　' : '') + '结论冻结时间：' + data.created_at;
+  const tbody = document.getElementById('verdictRows');
+  tbody.innerHTML = '';
+  data.rules.forEach((rule, i) => {
+    const v = data.verdicts[i];
+    let verdict, detail;
+    if (v.status === 'hit') {
+      const w = v.witness;
+      verdict = '<span class="tag hit">仍可命中</span>';
+      detail = '最小见证 <span class="mono">' + esc(w.protocol) + '　' + esc(w.src_ip) + ' → ' + esc(w.dst_ip) +
+               '　源端口 ' + w.src_port + '　目的端口 ' + w.dst_port + '</span>';
+    } else {
+      verdict = '<span class="tag shadowed">完全遮蔽</span>';
+      detail = '覆盖规则 ' + v.covered_by.map(id => '<span class="chip">' + esc(id) + '</span>').join('');
+    }
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td class="mono">' + (i + 1) + '</td>' +
+      '<td class="mono">' + esc(rule.id) + '</td>' +
+      '<td>' + esc(PROTO_LABEL[rule.protocol] || rule.protocol) + '</td>' +
+      '<td class="mono">' + esc(rule.src_cidr) + '</td>' +
+      '<td class="mono">' + esc(rule.dst_cidr) + '</td>' +
+      '<td class="mono">' + rule.src_port.start + '–' + rule.src_port.end + '</td>' +
+      '<td class="mono">' + rule.dst_port.start + '–' + rule.dst_port.end + '</td>' +
+      '<td>' + verdict + '</td>' +
+      '<td>' + detail + '</td>';
+    tbody.appendChild(tr);
+  });
+  const sec = document.getElementById('result');
+  sec.hidden = false;
+  sec.scrollIntoView({behavior: 'smooth'});
+}
+
+async function submitAudit() {
+  clearError();
+  const body = {audit_id: document.getElementById('auditId').value.trim(), rules: collectRules()};
+  const btn = document.getElementById('submitBtn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/audits', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { showError(formatError(resp.status, data)); return; }
+    renderResult(data, resp.status === 200
+      ? '该审计标识已存在且载荷一致，以下为既有冻结结论（幂等重放）。'
+      : '审计已创建，逐规则结论已冻结。');
+  } catch (e) {
+    showError('请求失败：' + e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function lookupAudit() {
+  clearError();
+  const id = document.getElementById('lookupId').value.trim();
+  if (!id) { showError('请输入审计标识。'); return; }
+  try {
+    const resp = await fetch('/api/audits/' + encodeURIComponent(id));
+    const data = await resp.json();
+    if (!resp.ok) { showError(formatError(resp.status, data)); return; }
+    renderResult(data, '以下为该审计标识对应的冻结结论。');
+  } catch (e) {
+    showError('请求失败：' + e);
+  }
+}
+
+function fillExample() {
+  rowsEl.innerHTML = '';
+  document.getElementById('auditId').value = 'audit-' + new Date().toISOString().slice(0, 10);
+  [
+    {id:'r1', protocol:'tcp', src_cidr:'10.0.0.0/24',     dst_cidr:'192.168.0.0/24', sp0:0, sp1:65535, dp0:80, dp1:85},
+    {id:'r2', protocol:'tcp', src_cidr:'10.0.0.128/25',   dst_cidr:'192.168.0.0/25', sp0:0, sp1:65535, dp0:80, dp1:90},
+    {id:'r3', protocol:'tcp', src_cidr:'10.0.0.0/25',     dst_cidr:'192.168.0.0/25', sp0:0, sp1:65535, dp0:82, dp1:84},
+  ].forEach(addRow);
+  clearError();
+}
+
+document.getElementById('addBtn').addEventListener('click', () => addRow());
+document.getElementById('exampleBtn').addEventListener('click', fillExample);
+document.getElementById('submitBtn').addEventListener('click', submitAudit);
+document.getElementById('lookupBtn').addEventListener('click', lookupAudit);
+addRow();
+</script>
+</body>
+</html>

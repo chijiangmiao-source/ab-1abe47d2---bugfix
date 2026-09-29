@@ -1,0 +1,30 @@
+name: flight-rule-auditor
+
+services:
+  app:
+    build: .
+    image: flight-rule-auditor:latest
+    # Host access port is configurable: HOST_PORT=9000 docker compose up app
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=3).status==200 else 1)"
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    build: .
+    image: flight-rule-auditor:latest
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_URL: http://app:8080
+    command: ["python", "-m", "verify.run"]
