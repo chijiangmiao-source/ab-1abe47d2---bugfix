@@ -2,10 +2,13 @@
 
 Runs, in order:
   1. build check   — byte-compile every shipped Python module
-  2. code tests    — the pytest suite (region algebra, engine, API)
+  2. code tests    — the pytest suite (region algebra, engine, API,
+                     concurrent settlement)
   3. HTTP smoke    — against the live service: one partially shadowed rule,
-                     one fully shadowed rule, and an illegal retransmission
-                     (same audit id, different payload)
+                     one fully shadowed rule, an illegal retransmission
+                     (same audit id, different payload), invalid CIDR, and
+                     concurrent waves of identical and differing payloads
+                     fired under one audit id
 
 Exits 0 only if every step passes; the Compose ``verify`` service surfaces
 this as its container exit code.
@@ -13,10 +16,12 @@ this as its container exit code.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -77,6 +82,104 @@ def wait_ready(timeout: float = 90.0) -> bool:
             pass
         time.sleep(1.0)
     return False
+
+
+def wave_payload(audit_id: str, n: int = 18, twist: tuple[int, int] | None = None):
+    """~18 legal rules with heavily overlapping CIDRs and port intervals."""
+    rules = []
+    for i in range(n):
+        rules.append(
+            {
+                "id": f"r{i + 1}",
+                "protocol": "both" if i % 3 == 0 else "tcp",
+                "src_cidr": "10.0.0.0/24" if i % 2 == 0 else "10.0.0.0/25",
+                "dst_cidr": "192.168.0.0/24",
+                "src_port": {"start": 0, "end": 65535},
+                "dst_port": {"start": 80 + (i % 5), "end": 90 + (i % 7)},
+            }
+        )
+    if twist is not None:
+        idx, end = twist
+        rules[idx]["dst_port"] = {**rules[idx]["dst_port"], "end": end}
+    return {"audit_id": audit_id, "rules": rules}
+
+
+def fire_wave(payloads):
+    """POST every payload concurrently behind one starting barrier."""
+    results = [None] * len(payloads)
+    barrier = threading.Barrier(len(payloads))
+
+    def worker(index):
+        barrier.wait()
+        results[index] = http("POST", "/api/audits", payloads[index])
+
+    threads = [
+        threading.Thread(target=worker, args=(i,)) for i in range(len(payloads))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert all(result is not None for result in results), "存在并发请求未返回"
+    return results
+
+
+def concurrent_waves():
+    # Wave 1: same audit id, identical payload — one frozen conclusion;
+    # one request creates it and every loser replays the exact same body.
+    same_id = f"wave-same-{int(time.time())}"
+    base = wave_payload(same_id)
+    results = fire_wave([copy.deepcopy(base) for _ in range(6)])
+    statuses = [status for status, _ in results]
+    assert 202 not in statuses, f"并发期间返回了处理中占位响应: {statuses}"
+    assert sorted(statuses) == [200] * 5 + [201], statuses
+    bodies = [body for _, body in results]
+    assert all(body == bodies[0] for body in bodies), "并发相同载荷的响应体不一致"
+    assert len(bodies[0]["verdicts"]) == 18
+    status, frozen = http("GET", f"/api/audits/{same_id}")
+    assert status == 200 and frozen == bodies[0], "冻结裁决与创建/重放响应不一致"
+    log("  ✓ 相同载荷并发：唯一 201 + 其余 200，响应完全一致且冻结可查")
+
+    # Wave 2: same audit id, mixed payloads fired simultaneously —
+    # create / replay / conflict all in one race; the losing payloads must
+    # be rejected without rewriting the frozen conclusions.
+    mixed_id = f"wave-mix-{int(time.time())}"
+    payload_a = wave_payload(mixed_id)
+    payload_b = wave_payload(mixed_id, twist=(17, 500))
+    payload_c = wave_payload(mixed_id, twist=(0, 600))
+    payloads = [
+        copy.deepcopy(payload_a),
+        copy.deepcopy(payload_a),
+        copy.deepcopy(payload_a),
+        copy.deepcopy(payload_a),
+        copy.deepcopy(payload_b),
+        copy.deepcopy(payload_c),
+    ]
+    results = fire_wave(payloads)
+    statuses = [status for status, _ in results]
+    assert 202 not in statuses, f"并发期间返回了处理中占位响应: {statuses}"
+    created = [i for i, status in enumerate(statuses) if status == 201]
+    assert len(created) == 1, f"应有且仅有一个创建请求: {statuses}"
+    winner_index = created[0]
+    winner_payload = payloads[winner_index]
+    winner_body = results[winner_index][1]
+
+    for i, (status, body) in enumerate(results):
+        if i == winner_index:
+            continue
+        same_as_winner = payloads[i]["rules"] == winner_payload["rules"]
+        if same_as_winner:
+            assert status == 200, f"相同载荷应重放: {status}"
+            assert body == winner_body, "重放响应与创建响应不完全一致"
+        else:
+            assert status == 409, f"异载荷竞争应冲突: {status}"
+            assert body["detail"]["error"] == "audit_id_conflict"
+            assert "verdicts" not in body
+
+    status, frozen = http("GET", f"/api/audits/{mixed_id}")
+    assert status == 200 and frozen == winner_body, "竞争结束后冻结裁决不正确"
+    assert frozen["rules"] == winner_payload["rules"]
+    log("  ✓ 混合载荷并发：创建/重放/冲突各得其所，冲突未留痕、未改写、不影响查询")
 
 
 def smoke() -> None:
@@ -152,6 +255,9 @@ def smoke() -> None:
     status, _ = http("GET", f"/api/audits/{bad_id}")
     assert status == 404, "被拒绝的请求不应留下审计记录"
     log("  ✓ 非法 CIDR 被拒绝（422）且未留下记录")
+
+    # Concurrent submissions of identical and differing payloads.
+    concurrent_waves()
 
     # The page is served.
     status, page = http("GET", "/")

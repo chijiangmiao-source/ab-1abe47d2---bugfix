@@ -44,35 +44,40 @@ def healthz() -> dict:
 def create_audit(req: AuditRequest):
     """Freeze per-rule verdicts for a new audit identifier.
 
-    Replaying the identical payload under the same audit id returns the
-    existing frozen conclusions (200).  The same audit id with a different
-    payload is rejected (409) and never rewrites the stored conclusions.
+    Concurrent submissions of the identical payload under the same audit
+    id settle as one frozen conclusion: one request creates it (201) and
+    every other request waits for the computation to finish and replays
+    the byte-identical conclusions (200).  Concurrent submissions of a
+    different payload under the same id are rejected (409) only once the
+    winning conclusion is frozen; the rejected request never stores a
+    record, never rewrites the winner and never affects later lookups.
     """
     payload = req.model_dump(mode="json")
     digest = fingerprint(payload)
+    audit_id = req.audit_id
 
-    existing, claimed = store.claim(req.audit_id, digest)
-    if existing is not None:
-        if existing.digest == digest:
-            return JSONResponse(status_code=200, content=existing.response())
-        raise HTTPException(status_code=409, detail=_conflict_detail(req.audit_id))
+    record, matches = store.wait_for_record(audit_id, digest)
+    if record is not None:
+        if matches:
+            return JSONResponse(status_code=200, content=record.response())
+        raise HTTPException(status_code=409, detail=_conflict_detail(audit_id))
 
-    if not claimed:
-        return JSONResponse(
-            status_code=202,
-            content={"audit_id": req.audit_id, "status": "processing"},
-        )
-
+    # This request owns the in-flight slot: compute the conclusions once.
     try:
-        record = new_record(req.audit_id, payload, analyze(req.rules))
-        winner = store.put_if_absent(record)
-    finally:
-        store.release_claim(req.audit_id, digest)
+        record = new_record(audit_id, payload, analyze(req.rules))
+        winner = store.freeze(record)
+    except BaseException:
+        # Let waiters claim the slot and retry instead of blocking forever.
+        store.abandon(audit_id)
+        raise
 
-    if winner.digest != digest:
-        raise HTTPException(status_code=409, detail=_conflict_detail(req.audit_id))
-    status_code = 201 if winner is record else 200
-    return JSONResponse(status_code=status_code, content=winner.response())
+    if winner is not record:
+        # Defensive: only the slot holder can freeze it, so this should be
+        # unreachable; never silently serve another payload's conclusions.
+        if winner.digest == digest:
+            return JSONResponse(status_code=200, content=winner.response())
+        raise HTTPException(status_code=409, detail=_conflict_detail(audit_id))
+    return JSONResponse(status_code=201, content=winner.response())
 
 
 @app.get("/api/audits/{audit_id}")
