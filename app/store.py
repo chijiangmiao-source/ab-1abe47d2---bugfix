@@ -36,41 +36,100 @@ class AuditRecord:
         }
 
 
+class LeaderAborted(RuntimeError):
+    """Raised to followers when the leader request fails before committing."""
+
+
+class _Slot:
+    """Per-audit rendezvous.
+
+    The first request for an audit id becomes the leader and computes the
+    conclusions; every concurrent follower blocks on the condition until a
+    record is published, then receives that same frozen record.  A follower
+    whose payload differs from the leader's gets ``None`` so the caller can
+    answer 409 -- it never waits on a foreign computation and never stores
+    anything.
+    """
+
+    __slots__ = ("leader_digest", "record", "aborted", "condition")
+
+    def __init__(self, leader_digest: str, condition: threading.Condition) -> None:
+        self.leader_digest = leader_digest
+        self.record: AuditRecord | None = None
+        self.aborted = False
+        self.condition = condition
+
+
 class AuditStore:
     """Thread-safe audit_id -> AuditRecord map.  Records never change."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._records: dict[str, AuditRecord] = {}
-        self._claims: dict[str, str] = {}
+        self._slots: dict[str, _Slot] = {}
 
     def get(self, audit_id: str) -> AuditRecord | None:
         with self._lock:
             return self._records.get(audit_id)
 
-    def put_if_absent(self, record: AuditRecord) -> AuditRecord:
-        """Store the record; return whatever record owns the slot."""
-        with self._lock:
-            existing = self._records.get(record.audit_id)
-            if existing is not None:
-                return existing
-            self._records[record.audit_id] = record
-            return record
+    def begin(
+        self, audit_id: str, digest: str
+    ) -> tuple[AuditRecord | None, _Slot | None, bool]:
+        """Join the creation of an audit id.
 
-    def claim(self, audit_id: str, digest: str) -> tuple[AuditRecord | None, bool]:
+        Returns ``(record, slot, is_leader)``:
+
+        * a finished ``record`` (slot None) -- replay it; compare digests to
+          decide 200 vs 409;
+        * ``(None, slot, True)`` -- this request is the leader and must
+          compute and :meth:`commit` the conclusions;
+        * ``(None, slot, False)`` -- a concurrent leader exists with the same
+          digest; :meth:`await_record` to receive its conclusions;
+        * ``(None, None, False)`` -- a concurrent leader exists with a
+          different digest: the request must be rejected (409).
+        """
         with self._lock:
             existing = self._records.get(audit_id)
             if existing is not None:
-                return existing, False
-            if audit_id in self._claims:
-                return None, False
-            self._claims[audit_id] = digest
-            return None, True
+                return existing, None, False
+            slot = self._slots.get(audit_id)
+            if slot is None:
+                slot = _Slot(digest, threading.Condition(self._lock))
+                self._slots[audit_id] = slot
+                return None, slot, True
+            if slot.leader_digest != digest:
+                return None, None, False
+            return None, slot, False
 
-    def release_claim(self, audit_id: str, digest: str) -> None:
+    def await_record(self, slot: _Slot) -> AuditRecord:
+        """Block until the leader publishes the frozen record."""
         with self._lock:
-            if self._claims.get(audit_id) == digest:
-                del self._claims[audit_id]
+            while slot.record is None:
+                if slot.aborted:
+                    raise LeaderAborted
+                slot.condition.wait()
+            return slot.record
+
+    def commit(self, audit_id: str, slot: _Slot, record: AuditRecord) -> AuditRecord:
+        """Publish the leader's conclusions; return the stored owner."""
+        with self._lock:
+            existing = self._records.get(audit_id)
+            if existing is None:
+                self._records[audit_id] = record
+                existing = record
+            slot.record = existing
+            slot.condition.notify_all()
+            if self._slots.get(audit_id) is slot:
+                del self._slots[audit_id]
+            return existing
+
+    def abort(self, audit_id: str, slot: _Slot) -> None:
+        """Release waiters after the leader failed; they retry as new leaders."""
+        with self._lock:
+            slot.aborted = True
+            slot.condition.notify_all()
+            if self._slots.get(audit_id) is slot:
+                del self._slots[audit_id]
 
 
 def new_record(audit_id: str, payload: dict, verdicts: list) -> AuditRecord:
